@@ -1,146 +1,105 @@
-/*
-  List external IP
-  Some services for getting the public IP are:
-    https://ipv4.icanhazip.com 
-    https://api.ipify.org 
-    https://ifconfig.co/ip
-*/
+resource "azurerm_network_interface" "vm-nic" {
+  name                                = "${local.name}-nic01"
+  location                            = var.location
+  resource_group_name                 = var.resource_group_name
 
-data "http" "public_ip" {
-  url = "https://api.ipify.org"
+  ip_configuration{
+      name                            = "ipconfig1"
+      subnet_id                       = data.azurerm_subnet.subnet.id
+      private_ip_address_allocation   = var.private_ip_address != "" ? "Static" : "Dynamic"
+      private_ip_address              = try(var.private_ip_address, null)
+    }
+
+  tags                                = local.tags
 }
 
-locals {
-  // Clean and set the public IP address
-  public_ip = chomp(data.http.public_ip.response_body)
-
-  // use public IP with /32 
-  authorized_ip_range = ["${local.public_ip}/32"]
-}
-
-data "azurerm_resource_group" "vm-rg" {
-  name = var.vm_rg
-}
-
-data "azurerm_resource_group" "vnet-rg" {
-  name = var.vnet_rg
-}
-
-data "azurerm_virtual_network" "vnet" {
-  name                = var.vnet_name
-  resource_group_name = data.azurerm_resource_group.vnet-rg.name
-}
-
-data "azurerm_subnet" "subnet" {
-  name                 = var.subnet_name
-  virtual_network_name = data.azurerm_virtual_network.vnet.name
-  resource_group_name  = data.azurerm_resource_group.vnet-rg.name
-}
-
-resource "azurerm_network_interface" "netinterface" {
-  name                = "${var.vm_name}-nic"
-  location            = var.region
-  resource_group_name = var.vnet_rg
-
-  ip_configuration {
-    name                          = "internal"
-    subnet_id                     = data.azurerm_subnet.subnet.id
-    private_ip_address_allocation = "Dynamic"
-    // Not needed when using a VPN or Bastion 
-    public_ip_address_id = azurerm_public_ip.public_ip.id
-  }
-}
-
-resource "azurerm_public_ip" "public_ip" {
-  name                = "vm_public_ip"
-  resource_group_name = data.azurerm_resource_group.vm-rg.name
-  location            = data.azurerm_resource_group.vm-rg.location
-  allocation_method   = "Dynamic"
-}
-
-// NSG
-resource "azurerm_network_security_group" "vm-nsg" {
-  name                = "vm-nsg"
-  location            = var.region
-  resource_group_name = data.azurerm_resource_group.vm-rg.name
-}
-
-
-// Not needed when using a VPN or Bastion
-// NSG Security RDP rule(s)
-resource "azurerm_network_security_rule" "vm-sec-rule" {
-  access                      = "Allow"
-  destination_address_prefix  = "*"
-  destination_port_range      = "3389"
-  direction                   = "Inbound"
-  name                        = "RDP"
-  network_security_group_name = azurerm_network_security_group.vm-nsg.name
-  priority                    = 100
-  protocol                    = "Tcp"
-  resource_group_name         = data.azurerm_resource_group.vm-rg.name
-  source_address_prefixes     = local.authorized_ip_range
-  source_port_range           = "*"
-  depends_on = [
-    azurerm_network_security_group.vm-nsg,
-  ]
-}
-
-// Connect security group to NIC
-resource "azurerm_network_interface_security_group_association" "nsg-connect" {
-  network_interface_id      = azurerm_network_interface.netinterface.id
-  network_security_group_id = azurerm_network_security_group.vm-nsg.id
-}
-
-// Create VM
 resource "azurerm_windows_virtual_machine" "vm" {
-  admin_username = var.vm_username
-  admin_password = var.vm_password
-  location       = var.region
-  name           = var.vm_name
-  network_interface_ids = [
-    azurerm_network_interface.netinterface.id
-  ]
-  resource_group_name = var.vm_rg
-  secure_boot_enabled = true
-  size                = var.vm_size
-  tags = {
-    Environment = var.tag_environment
+  name                                = local.name
+  admin_username                      = var.admin_username
+  admin_password                      = var.admin_password
+  location                            = var.location
+  resource_group_name                 = var.resource_group_name
+  network_interface_ids               = [ azurerm_network_interface.vm-nic.id ]
+  license_type                        = var.windows_license
+  secure_boot_enabled                 = var.secure_boot_enabled
+  provision_vm_agent                  = var.provision_vm_agent
+  timezone                            = var.timezone
+  size                                = var.size
+  vtpm_enabled                        = var.vtpm_enabled
+  zone                                = var.availability_zone
+  
+  boot_diagnostics {
   }
-  timezone     = var.vm_timezone
-  vtpm_enabled = true
+  
+  source_image_reference {
+    publisher                         = var.publisher
+    offer                             = var.offer
+    sku                               = var.sku
+    version                           = var.image_version
+  }
 
   os_disk {
-    caching              = "ReadWrite"
-    storage_account_type = var.vm_storage
+    name                              = "${local.name}-osdisk"
+    caching                           = var.os_disk_caching
+    storage_account_type              = var.os_disk_storage_account_type
   }
+  
+  tags                                = local.tags
+}
 
-  source_image_reference {
-    offer     = var.offer
-    publisher = var.publisher
-    sku       = var.sku
-    version   = "latest"
-  }
+resource "azurerm_managed_disk" "vm-datadisk" {
+  for_each                            = var.data_disks != null ? var.data_disks : {}
+
+  location                            = var.location
+  resource_group_name                 = var.resource_group_name
+  zone                                = var.availability_zone
+
+  name                                = "${local.name}-datadisk${format("%02s", each.key)}"
+  storage_account_type                = try(each.value.storage_account_type, null) == null ? "Premium_LRS" : each.value.storage_account_type
+  create_option                       = try(each.value.create_option, null) == null ? "Empty" : each.value.create_option
+  disk_size_gb                        = try(each.value.disk_size_gb, null) == null ? "16" : each.value.disk_size_gb
+
+  tags                                = local.tags
+}
+
+resource "azurerm_virtual_machine_data_disk_attachment" "vm-datadisk-attachment" {
+  for_each                            = var.data_disks != null ? var.data_disks : {}
+
+  managed_disk_id                     = azurerm_managed_disk.vm-datadisk[each.key].id
+  virtual_machine_id                  = azurerm_windows_virtual_machine.vm.id
+  lun                                 = 0 + each.key
+  caching                             = try(each.value.caching, null) == null ? "None" : each.value.caching
+}
+
+resource "azurerm_backup_protected_vm" "vm-protect" {
+  count                               = var.deploy_backup_rsv ? 1 : 0
+
+  resource_group_name                 = var.rg_backup_name
+  recovery_vault_name                 = var.rsv_name
+  source_vm_id                        = azurerm_windows_virtual_machine.vm.id
+  backup_policy_id                    = var.rsv_policy_id
 }
 
 // https://learn.microsoft.com/en-us/azure/virtual-machines/extensions/custom-script-windows
 resource "azurerm_virtual_machine_extension" "vmextension" {
-  name                       = "post_install"
-  virtual_machine_id         = azurerm_windows_virtual_machine.vm.id
-  publisher                  = "Microsoft.Compute"
-  type                       = "CustomScriptExtension"
-  type_handler_version       = "1.9"
-  auto_upgrade_minor_version = "true"
+  count = var.post_install_uris != "" ? 1 : 0
+  name                                   =  "post_install"
+  virtual_machine_id                     =  azurerm_windows_virtual_machine.vm.id
+  publisher                              =  "Microsoft.Compute"
+  type                                   =  "CustomScriptExtension"
+  type_handler_version                   =  "1.9"
+  auto_upgrade_minor_version             =  "true"
 
-  protected_settings = <<PROTECTED_SETTINGS
+  protected_settings                     =  <<PROTECTED_SETTINGS
     {
        "commandToExecute": "powershell -ExecutionPolicy Unrestricted -file post_install.ps1 -EnableCredSSP -DisableBasicAuth"
     }
   PROTECTED_SETTINGS
 
-  settings = <<SETTINGS
+  settings                               =  <<SETTINGS
     {
       "fileUris": [
-        "${var.file_uris}"
+        "${var.post_install_uris}"
         ]
     }
   SETTINGS
@@ -148,22 +107,16 @@ resource "azurerm_virtual_machine_extension" "vmextension" {
 
 // Shutdown the VM
 resource "azurerm_dev_test_global_vm_shutdown_schedule" "vmshutdown" {
-  daily_recurrence_time = var.vm_shutdown
-  location              = var.region
-  timezone              = var.vm_timezone
-  virtual_machine_id    = azurerm_windows_virtual_machine.vm.id
+  count = var.vm_shutdown != "" ? 1 : 0
+
+  daily_recurrence_time                  =  var.vm_shutdown
+  location                               =  var.location
+  timezone                               =  var.timezone
+  virtual_machine_id                     =  azurerm_windows_virtual_machine.vm.id
   notification_settings {
-    enabled = false
+    enabled                              =  false
   }
-  depends_on = [
+  depends_on                             =  [
     azurerm_windows_virtual_machine.vm,
   ]
-}
-
-output "private_ip" {
-  value = azurerm_network_interface.netinterface.private_ip_address
-}
-
-output "public_ip" {
-  value = azurerm_windows_virtual_machine.vm.public_ip_address
 }
